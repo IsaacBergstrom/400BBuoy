@@ -40,9 +40,12 @@ WIND_SAMPLE_INTERVAL_S = 0.1
 # Time to wait for DS18B20 conversion to complete (in milliseconds).
 TEMP_CONVERSION_WAIT_MS = 750
 
+# File to which buoy data is logged (must be readable by PostProcess.py)
+CSV_FILENAME = "accel.csv"
+
 
 def read_positional():
-    """Read IMU, magnetometer, and encoder angle."""
+    """Read IMU (accelerometer/gyro) and magnetometer."""
 
     ax, ay, az = imu.acceleration
     gx, gy, gz = imu.gyro
@@ -51,16 +54,10 @@ def read_positional():
     raw_mag = compass.i2c_readregs(0x00, 6)
     mx, my, mz = ustruct.unpack('<hhh', raw_mag)
 
-    try:
-        ang = encoder.RAWANGLE()
-    except TypeError:
-        ang = encoder.RAWANGLE
-
     return {
         "accel": (ax, ay, az),
         "gyro": (gx, gy, gz),
         "mag": (mx, my, mz),
-        "angle": ang,
     }
 
 
@@ -148,34 +145,51 @@ def read_wind(duration_s=WIND_SAMPLE_DURATION_S, interval_s=WIND_SAMPLE_INTERVAL
 
 def run_full_stream():
     print("\n" + "=" * 95)
-    print(f"{'ACCEL (m/s^2)':^18} | {'GYRO (deg/s)':^18} | {'MAG (Raw)':^18} | {'ANGLE'}")
-    print(f"{'X      Y      Z':^18} | {'X      Y      Z':^18} | {'X      Y      Z':^18} | {'0-4095'}")
+    print(f"{'ACCEL (m/s^2)':^18} | {'GYRO (deg/s)':^18} | {'MAG (Raw)':^18}")
+    print(f"{'X      Y      Z':^18} | {'X      Y      Z':^18} | {'X      Y      Z':^18}")
     print("=" * 95)
 
     # --- 1) Read positional data for POSITION_SAMPLE_DURATION_S ---
     start_ms = time.ticks_ms()
-    while time.ticks_diff(time.ticks_ms(), start_ms) < int(POSITION_SAMPLE_DURATION_S * 1000):
-        data = read_positional()
-        ax, ay, az = data["accel"]
-        gx, gy, gz = data["gyro"]
-        mx, my, mz = data["mag"]
-        ang = data["angle"]
 
-        accel_str = f"{ax:>5.1f} {ay:>5.1f} {az:>5.1f}"
-        gyro_str = f"{gx:>5.1f} {gy:>5.1f} {gz:>5.1f}"
-        mag_str = f"{mx:>5} {my:>5} {mz:>5}"
+    with open(CSV_FILENAME, "w") as f:
+        while time.ticks_diff(time.ticks_ms(), start_ms) < int(POSITION_SAMPLE_DURATION_S * 1000):
+            data = read_positional()
+            ax, ay, az = data["accel"]
+            gx, gy, gz = data["gyro"]
+            mx, my, mz = data["mag"]
 
-        print(f"{accel_str} | {gyro_str} | {mag_str} | {ang:>4}", end="\r")
+            # Write a CSV row compatible with PostProcess.py (6 values)
+            # Format: ax,ay,az,gx,gy,gz
+            f.write(f"{ax},{ay},{az},{gx},{gy},{gz}\n")
 
-        time.sleep(0.1)  # 10Hz refresh rate
+            accel_str = f"{ax:>5.1f} {ay:>5.1f} {az:>5.1f}"
+            gyro_str = f"{gx:>5.1f} {gy:>5.1f} {gz:>5.1f}"
+            mag_str = f"{mx:>5} {my:>5} {mz:>5}"
 
-    # --- 2) Read temperatures once, then exit ---
+            print(f"{accel_str} | {gyro_str} | {mag_str}", end="\r")
+
+            time.sleep(0.1)  # 10Hz refresh rate
+
     temps = read_temperatures()
     print("\nTemps:", temps)
+
+    with open(CSV_FILENAME, "a") as f:
+        # Add a marker line at end for temperatures
+        # Format: TEMPS,t1,t2,t3
+        temp_strs = ["" if t is None else f"{t}" for t in temps]
+        f.write("TEMPS," + ",".join(temp_strs) + "\n")
 
     # --- 3) Read wind direction/speed once, then exit ---
     wind = read_wind()
     print("Wind:", wind)
+
+    with open(CSV_FILENAME, "a") as f:
+        # Add a marker line at end for wind
+        # Format: WIND,direction,speed
+        dir_str = "" if wind["avg_direction"] is None else f"{wind['avg_direction']}"
+        spd_str = "" if wind["avg_speed"] is None else f"{wind['avg_speed']}"
+        f.write("WIND," + dir_str + "," + spd_str + "\n")
 
 # Launch the stream
 run_full_stream()
