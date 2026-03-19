@@ -159,9 +159,9 @@ def run_full_stream():
             gx, gy, gz = data["gyro"]
             mx, my, mz = data["mag"]
 
-            # Write a CSV row compatible with PostProcess.py (6 values)
-            # Format: ax,ay,az,gx,gy,gz
-            f.write(f"{ax},{ay},{az},{gx},{gy},{gz}\n")
+            # Write a CSV row compatible with PostProcess.py (9 values)
+            # Format: ax,ay,az,gx,gy,gz,mx,my,mz
+            f.write(f"{ax},{ay},{az},{gx},{gy},{gz},{mx},{my},{mz}\n")
 
             accel_str = f"{ax:>5.1f} {ay:>5.1f} {az:>5.1f}"
             gyro_str = f"{gx:>5.1f} {gy:>5.1f} {gz:>5.1f}"
