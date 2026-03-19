@@ -1,156 +1,181 @@
-"""Dual-use script:
-
-- on the ESP32/other MicroPython board the file can initialize the
-  IMU and record a short burst of acceleration data.
-- on a host machine the same file can load the captured data and
-  display it with ``matplotlib``.
-
-The device only needs the standard firmware plus the third‑party
-``mpu9250.py`` driver; the plotting portion lives entirely on the PC.
-"""
-
-import sys
-
-IS_MICROPY = sys.implementation.name.lower().startswith("micropython")
-
-if not IS_MICROPY:
-    # host-mode imports
-    import matplotlib.pyplot as plt
-    import csv
-
-# universal imports
-try:
-    from machine import Pin, SoftI2C  # type: ignore
-except ImportError:
-    Pin = SoftI2C = None
-
+import ustruct
 import time
+import math
+import onewire
+import ds18x20
+from machine import Pin, SoftI2C
 
-# MPU driver is third-party; only available on the board
-try:
-    from mpu9250 import MPU9250, MPU6500  # type: ignore
-except ImportError:
-    MPU9250 = MPU6500 = None
+# --- 1. Import Libraries (Ensure these files are on your Pico) ---
+from mpu6500 import MPU6500
+from qmc5883P import QMC5883
+from AS5600 import AS5600
+
+# --- 2. Hardware Setup (I2C) ---
+i2c = SoftI2C(scl=Pin(3), sda=Pin(2))
+
+# Initialize the 3 I2C Sensors
+# These are the "definitions" the error was looking for
+imu = MPU6500(i2c, 0x69)      # This defines 'imu'
+compass = QMC5883(i2c)         # This defines 'compass'
+encoder = AS5600(i2c)         # This defines 'encoder'
+
+# --- 3. Temperature probe setup (DS18B20) ---
+# Each probe can sit on its own 1-Wire pin (GP15/GP16/GP17).
+TEMP_PINS = [15, 16, 17]
+
+temp_buses = [onewire.OneWire(Pin(pin)) for pin in TEMP_PINS]
+temp_sensors = [ds18x20.DS18X20(bus) for bus in temp_buses]
+
+# --- 4. Wind sensing (magnetic encoder + hall-effect) ---
+# The magnetic encoder provides an angle; wind speed via hall-effect is not
+# implemented yet, but we reserve a pin for it.
+HALL_PIN = 18
+hall_pin = Pin(HALL_PIN, Pin.IN, Pin.PULL_UP)
+
+# --- Sensor runtime configuration (global) ---
+# Duration for how long each sensor group is sampled before moving on.
+POSITION_SAMPLE_DURATION_S = 10.0
+WIND_SAMPLE_DURATION_S = 10.0
+WIND_SAMPLE_INTERVAL_S = 0.1
+# Time to wait for DS18B20 conversion to complete (in milliseconds).
+TEMP_CONVERSION_WAIT_MS = 750
 
 
-# ---------------------------------------------------------------------------
-# device helpers
-# ---------------------------------------------------------------------------
+def read_positional():
+    """Read IMU, magnetometer, and encoder angle."""
 
-def init_i2c():
-    """Create and configure the I2C bus; enable magnetometer pass-through."""
-    i2c = SoftI2C(scl=Pin(22), sda=Pin(21))
-    print("I2C devices:", i2c.scan())
-    i2c.writeto_mem(0x69, 0x37, b"\x02")
-    return i2c
+    ax, ay, az = imu.acceleration
+    gx, gy, gz = imu.gyro
 
+    compass.measure()
+    raw_mag = compass.i2c_readregs(0x00, 6)
+    mx, my, mz = ustruct.unpack('<hhh', raw_mag)
 
-def collect_imu_data(duration_s=10.0, interval_s=0.05):
-    """Return a list of IMU samples taken for ``duration_s`` seconds.
-
-    Each sample is a tuple: (ax, ay, az, gx, gy, gz, temp)
-    """
-    if not IS_MICROPY:
-        raise RuntimeError("collect_imu_data() only available on MicroPython")
-    i2c = init_i2c()
-    mpu = MPU6500(i2c, address=0x69)
-    samples = []
-    end = time.ticks_ms() + int(duration_s * 1000)
-    while time.ticks_ms() < end:
-        accel = tuple(mpu.acceleration)
-        gyro = tuple(mpu.gyro)
-        temp = mpu.temperature
-        samples.append(accel + gyro + (temp,))
-        time.sleep_ms(int(interval_s * 1000))
-    return samples
-
-
-def save_samples(samples, filename="accel.csv"):
-    """Write IMU samples to a CSV file on the board.
-
-    After writing we reopen the file and dump its contents to the REPL so
-    you can copy/paste it over to your PC even if you can't run a tool like
-    ``ampy``.  On the ESP32 the file lives in the internal filesystem;
-    executing ``import os; os.listdir()`` at the REPL will show it.
-    """
-    if not IS_MICROPY:
-        raise RuntimeError("save_samples() only available on MicroPython")
-
-    with open(filename, "w") as f:
-        for sample in samples:
-            f.write(",".join(str(v) for v in sample) + "\n")
-    print(f"saved {len(samples)} samples to {filename}")
-
-    # dump the actual file so the host can grab it through the serial log
     try:
-        with open(filename, "r") as f:
-            print("--- file contents ---")
-            for line in f:
-                sys.stdout.write(line)
-            print("--- end file ---")
-    except Exception as e:
-        print("could not read back", e)
+        ang = encoder.RAWANGLE()
+    except TypeError:
+        ang = encoder.RAWANGLE
+
+    return {
+        "accel": (ax, ay, az),
+        "gyro": (gx, gy, gz),
+        "mag": (mx, my, mz),
+        "angle": ang,
+    }
 
 
+def read_temperatures(wait_ms=TEMP_CONVERSION_WAIT_MS):
+    """Read temperatures from up to three DS18B20 probes.
 
-# ---------------------------------------------------------------------------
-# host helpers
-# ---------------------------------------------------------------------------
+    Returns list [t1, t2, t3] where missing/failed sensors are None.
+    """
 
-def load_samples(filename="accel.csv"):
-    """Load samples from a CSV file created by the device."""
-    if IS_MICROPY:
-        raise RuntimeError("load_samples() only available on host Python")
-    data = []
-    with open(filename, newline="") as f:
-        reader = csv.reader(f)
-        for row in reader:
-            if len(row) != 3:
-                continue
-            data.append(tuple(float(v) for v in row))
-    return data
-
-
-def plot_samples(samples=None, filename="accel.csv"):
-    """Plot the three acceleration components over time."""
-    if samples is None:
-        samples = load_samples(filename)
-    if not samples:
-        print("no data to plot")
-        return
-    t = list(range(len(samples)))
-    xs = [s[0] for s in samples]
-    ys = [s[1] for s in samples]
-    zs = [s[2] for s in samples]
-    plt.figure()
-    plt.plot(t, xs, label="x")
-    plt.plot(t, ys, label="y")
-    plt.plot(t, zs, label="z")
-    plt.xlabel("sample #")
-    plt.ylabel("accel")
-    plt.legend()
-    plt.title("Acceleration vs sample number")
-    plt.show()
-
-
-# ---------------------------------------------------------------------------
-# entry logic
-# ---------------------------------------------------------------------------
-
-if __name__ == "__main__":
-    if IS_MICROPY:
-        # perform the 10‑second run and store results
-        data = collect_imu_data(10.0, 0.05)  # ~20Hz sampling
-        save_samples(data)
-        print("SAMPLES:")
-        for row in data:
-            print(row)
-        # helpful reminder for the developer
+    # Start conversion on all connected buses
+    for ds in temp_sensors:
         try:
-            import os
-            print("files on device:", os.listdir())
+            ds.convert_temp()
         except Exception:
             pass
+
+    time.sleep_ms(wait_ms)
+
+    temps = []
+    for ds in temp_sensors:
+        roms = ds.scan()
+        if not roms:
+            temps.append(None)
+            continue
+        try:
+            temps.append(ds.read_temp(roms[0]))
+        except Exception:
+            temps.append(None)
+
+    return temps
+
+
+def read_wind(duration_s=WIND_SAMPLE_DURATION_S, interval_s=WIND_SAMPLE_INTERVAL_S):
+    """Measure wind over a span of time and return average direction/speed.
+
+    This function is designed so that once the hall-effect speed sensor is
+    implemented, it can sample speed continuously and return an average.
+
+    Args:
+        duration_s: Total measurement time in seconds.
+        interval_s: Sampling interval in seconds.
+
+    Returns:
+        dict: {"avg_direction": <deg>, "avg_speed": <units>}
+    """
+
+    # Accumulate vector sums to compute a circular mean (avoids wraparound issues).
+    sum_sin = 0.0
+    sum_cos = 0.0
+    count = 0
+    speed_samples = []  # placeholder for future hall-effect speed values
+
+    end_ms = time.ticks_add(time.ticks_ms(), int(duration_s * 1000))
+    while time.ticks_diff(end_ms, time.ticks_ms()) > 0:
+        try:
+            raw = encoder.RAWANGLE() if callable(encoder.RAWANGLE) else encoder.RAWANGLE
+            # Assume encoder returns 0–4095 (12-bit) where 0/4095 ≈ 0/360°
+            # Convert to degrees.
+            angle_deg = (raw / 4096.0) * 360.0 if raw is not None else None
+        except Exception:
+            angle_deg = None
+
+        if angle_deg is not None:
+            theta = angle_deg * (3.141592653589793 / 180.0)
+            sum_sin += math.sin(theta)
+            sum_cos += math.cos(theta)
+            count += 1
+
+        # TODO: add hall-effect speed sampling here and append to speed_samples
+
+        time.sleep(interval_s)
+
+    if count:
+        avg_theta = math.atan2(sum_sin / count, sum_cos / count)
+        avg_dir = (avg_theta * 180.0 / 3.141592653589793) % 360.0
     else:
-        print("host mode – plotting accel.csv")
-        plot_samples()
+        avg_dir = None
+
+    avg_speed = None
+    if speed_samples:
+        avg_speed = sum(speed_samples) / len(speed_samples)
+
+    return {"avg_direction": avg_dir, "avg_speed": avg_speed}
+
+
+def run_full_stream():
+    print("\n" + "=" * 95)
+    print(f"{'ACCEL (m/s^2)':^18} | {'GYRO (deg/s)':^18} | {'MAG (Raw)':^18} | {'ANGLE'}")
+    print(f"{'X      Y      Z':^18} | {'X      Y      Z':^18} | {'X      Y      Z':^18} | {'0-4095'}")
+    print("=" * 95)
+
+    # --- 1) Read positional data for POSITION_SAMPLE_DURATION_S ---
+    start_ms = time.ticks_ms()
+    while time.ticks_diff(time.ticks_ms(), start_ms) < int(POSITION_SAMPLE_DURATION_S * 1000):
+        data = read_positional()
+        ax, ay, az = data["accel"]
+        gx, gy, gz = data["gyro"]
+        mx, my, mz = data["mag"]
+        ang = data["angle"]
+
+        accel_str = f"{ax:>5.1f} {ay:>5.1f} {az:>5.1f}"
+        gyro_str = f"{gx:>5.1f} {gy:>5.1f} {gz:>5.1f}"
+        mag_str = f"{mx:>5} {my:>5} {mz:>5}"
+
+        print(f"{accel_str} | {gyro_str} | {mag_str} | {ang:>4}", end="\r")
+
+        time.sleep(0.1)  # 10Hz refresh rate
+
+    # --- 2) Read temperatures once, then exit ---
+    temps = read_temperatures()
+    print("\nTemps:", temps)
+
+    # --- 3) Read wind direction/speed once, then exit ---
+    wind = read_wind()
+    print("Wind:", wind)
+
+# Launch the stream
+run_full_stream()
