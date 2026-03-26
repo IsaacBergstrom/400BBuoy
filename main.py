@@ -1,44 +1,93 @@
-import ustruct
-import time
+"""
+main.py — Pico Weather Station
+Sequence: IMU/Mag stream (20 s) → Temperature read → Wind speed (5 s)
+All data saved to /sd/accel.csv (auto-incremented if file already exists)
+"""
+
+import os
 import math
-import onewire
-import ds18x20
+import time
+import ustruct
+import machine
 from machine import Pin, SoftI2C
 
-# --- 1. Import Libraries (Ensure these files are on your Pico) ---
+import onewire
+import ds18x20
+import sdcard
+
 from mpu6500 import MPU6500
 from qmc5883P import QMC5883
 from AS5600 import AS5600
 
-# --- 2. Hardware Setup (I2C) ---
-i2c = SoftI2C(scl=Pin(3), sda=Pin(2))
+# ── 1. SD Card (SPI 1) ────────────────────────────────────────────────────────
+spi = machine.SPI(
+    1,
+    baudrate=1_000_000,
+    sck=machine.Pin(10),
+    mosi=machine.Pin(11),
+    miso=machine.Pin(12),
+)
+cs = machine.Pin(13, machine.Pin.OUT, value=1)
 
-# Initialize the 3 I2C Sensors
+try:
+    sd = sdcard.SDCard(spi, cs)
+    os.mount(sd, "/sd")
+    print("SD card mounted.")
+except Exception as e:
+    print("SD mount failed:", e)
+    raise   # Nothing can be saved without the SD card — stop here.
+
+
+def get_next_filename(base="accel", ext=".csv"):
+    """Return /sd/accel.csv, /sd/accel1.csv, /sd/accel2.csv … whichever is free."""
+    files = os.listdir("/sd/")
+    candidate = f"{base}{ext}"
+    if candidate not in files:
+        return "/sd/" + candidate
+    n = 1
+    while True:
+        candidate = f"{base}{n}{ext}"
+        if candidate not in files:
+            return "/sd/" + candidate
+        n += 1
+
+
+CSV_PATH = get_next_filename()
+print(f"Logging to: {CSV_PATH}")
+
+# ── 2. I2C Sensors ────────────────────────────────────────────────────────────
+i2c     = SoftI2C(scl=Pin(3), sda=Pin(2), freq=400_000)
 imu     = MPU6500(i2c, 0x69)
 compass = QMC5883(i2c)
 encoder = AS5600(i2c)
 
-# --- 3. Temperature probe setup (DS18B20) ---
-TEMP_PINS    = [7, 8, 9]
-temp_buses   = [onewire.OneWire(Pin(pin)) for pin in TEMP_PINS]
+# ── 3. Temperature Probes (DS18B20) ───────────────────────────────────────────
+TEMP_PINS    = [7, 8, 9]          # 2 of 3 physically connected — safe to scan all
+temp_buses   = [onewire.OneWire(Pin(p)) for p in TEMP_PINS]
 temp_sensors = [ds18x20.DS18X20(bus) for bus in temp_buses]
 
-# --- 4. Wind sensing ---
-HALL_PIN = 18
-hall_pin = Pin(HALL_PIN, Pin.IN, Pin.PULL_UP)
+TEMP_CONVERSION_WAIT_MS = 750
 
-# --- Sensor runtime configuration ---
-POSITION_SAMPLE_DURATION_S = 20.0
-WIND_SAMPLE_DURATION_S     = 10.0
-WIND_SAMPLE_INTERVAL_S     = 0.1
-TEMP_CONVERSION_WAIT_MS    = 750
-SAMPLE_INTERVAL_S          = 0.1   # 10 Hz
+# ── 4. Hall-Effect Wind Sensor (GP16, IRQ) ────────────────────────────────────
+hall_pin = Pin(16, Pin.IN, Pin.PULL_UP)
+click_timestamps = []   # populated by ISR
 
-CSV_FILENAME = "accel.csv"
+def _hall_irq(pin):
+    click_timestamps.append(time.ticks_us())
 
+hall_pin.irq(trigger=Pin.IRQ_FALLING, handler=_hall_irq)
+
+# ── Runtime config ────────────────────────────────────────────────────────────
+POSITION_SAMPLE_DURATION_S = 20.0   # how long to stream IMU/Mag
+WIND_SAMPLE_DURATION_S      = 10.0  # hall-effect window
+IMU_SAMPLE_INTERVAL_S       =  0.1  # 10 Hz
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helper functions
+# ─────────────────────────────────────────────────────────────────────────────
 
 def read_positional():
-    """Read IMU (accelerometer/gyro) and magnetometer."""
+    """Return one IMU + magnetometer sample."""
     ax, ay, az = imu.acceleration
     gx, gy, gz = imu.gyro
 
@@ -46,16 +95,13 @@ def read_positional():
     raw_mag = compass.i2c_readregs(0x00, 6)
     mx, my, mz = ustruct.unpack('<hhh', raw_mag)
 
-    return {
-        "accel": (ax, ay, az),
-        "gyro":  (gx, gy, gz),
-        "mag":   (mx, my, mz),
-    }
+    return (ax, ay, az, gx, gy, gz, mx, my, mz)
 
 
-def read_temperatures(wait_ms=TEMP_CONVERSION_WAIT_MS):
-    """Read temperatures from up to three DS18B20 probes.
-    Returns list [t1, t2, t3] where missing/failed sensors are None.
+def read_temperatures():
+    """
+    Trigger conversion on every bus, wait, then read.
+    Returns [t1, t2, t3]; missing/failed probes → None.
     """
     for ds in temp_sensors:
         try:
@@ -63,7 +109,7 @@ def read_temperatures(wait_ms=TEMP_CONVERSION_WAIT_MS):
         except Exception:
             pass
 
-    time.sleep_ms(wait_ms)
+    time.sleep_ms(TEMP_CONVERSION_WAIT_MS)
 
     temps = []
     for ds in temp_sensors:
@@ -79,78 +125,89 @@ def read_temperatures(wait_ms=TEMP_CONVERSION_WAIT_MS):
     return temps
 
 
-def read_wind(duration_s=WIND_SAMPLE_DURATION_S,
-              interval_s=WIND_SAMPLE_INTERVAL_S):
-    """Measure wind over a span of time and return average direction/speed.
-
-    Uses circular mean to avoid 0°/360° wraparound errors.
-    """
-    sum_sin      = 0.0
-    sum_cos      = 0.0
-    count        = 0
-    speed_samples = []
+def read_wind_direction(duration_s=WIND_SAMPLE_DURATION_S, interval_s=0.1):
+    """Poll AS5600 for `duration_s` seconds, return circular-mean direction in degrees."""
+    sum_sin   = 0.0
+    sum_cos   = 0.0
+    dir_count = 0
 
     end_ms = time.ticks_add(time.ticks_ms(), int(duration_s * 1000))
     while time.ticks_diff(end_ms, time.ticks_ms()) > 0:
         try:
-            raw = encoder.RAWANGLE() if callable(encoder.RAWANGLE) else encoder.RAWANGLE
-            angle_deg = (raw / 4096.0) * 360.0 if raw is not None else None
+            raw = encoder.RAWANGLE
+            if raw is not None:
+                angle_deg  = (int(raw) / 4096.0) * 360.0
+                theta      = angle_deg * (math.pi / 180.0)
+                sum_sin   += math.sin(theta)
+                sum_cos   += math.cos(theta)
+                dir_count += 1
         except Exception:
-            angle_deg = None
-
-        if angle_deg is not None:
-            theta     = angle_deg * (math.pi / 180.0)
-            sum_sin  += math.sin(theta)
-            sum_cos  += math.cos(theta)
-            count    += 1
-
-        # TODO: hall-effect speed sampling → append to speed_samples
-
+            pass
         time.sleep(interval_s)
 
-    avg_dir = None
-    if count:
-        avg_theta = math.atan2(sum_sin / count, sum_cos / count)
-        avg_dir   = (avg_theta * 180.0 / math.pi) % 360.0
+    if dir_count:
+        avg_theta = math.atan2(sum_sin / dir_count, sum_cos / dir_count)
+        return (avg_theta * 180.0 / math.pi) % 360.0
+    return None
 
-    avg_speed = (sum(speed_samples) / len(speed_samples)) if speed_samples else None
 
-    return {"avg_direction": avg_dir, "avg_speed": avg_speed}
+def read_wind_speed(duration_s=WIND_SAMPLE_DURATION_S):
+    """Count hall-effect pulses for `duration_s` seconds via ISR. Returns CPS and avg period."""
+    global click_timestamps
+    click_timestamps = []           # reset ISR buffer
 
+    time.sleep(duration_s)          # ISR fills list in background
+
+    samples = list(click_timestamps)
+    total   = len(samples)
+    cps     = total / duration_s
+
+    avg_period_s = None
+    if total > 1:
+        span_us = time.ticks_diff(samples[-1], samples[0])
+        if span_us > 0:
+            avg_period_s = (span_us / 1_000_000) / (total - 1)
+
+    return {
+        "total_clicks" : total,
+        "cps"          : cps,
+        "avg_period_s" : avg_period_s,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main routine
+# ─────────────────────────────────────────────────────────────────────────────
 
 def run_full_stream():
+    # ── Console header ────────────────────────────────────────────────────────
     print("\n" + "=" * 115)
-    print(f"{'TIME (ms)':>10} | {'ACCEL (m/s^2)':^20} | {'GYRO (deg/s)':^20} | {'MAG (Raw)':^20}")
+    print(f"{'TIME (s)':>10} | {'ACCEL (m/s²)':^20} | {'GYRO (°/s)':^20} | {'MAG (raw)':^20}")
     print(f"{'':>10} | {'X      Y      Z':^20} | {'X      Y      Z':^20} | {'X      Y      Z':^20}")
     print("=" * 115)
 
-    # Record the absolute start time in milliseconds (MicroPython epoch)
-    # time.ticks_ms() is a relative ms counter — we use it for dt only.
-    # For an absolute wall-clock stamp we use time.time() (seconds since epoch).
-    # Both are written so PostProcess.py can use whichever is more convenient.
-    epoch_start_s  = time.time()          # absolute seconds (RTC, if set)
-    ticks_start_ms = time.ticks_ms()      # relative ms counter
+    epoch_start_s  = time.time()
+    ticks_start_ms = time.ticks_ms()
 
-    with open(CSV_FILENAME, "w") as f:
-        # Header comment — PostProcess.py skips non-numeric rows automatically
+    with open(CSV_PATH, "w") as f:
+        # ── File header ───────────────────────────────────────────────────────
         f.write(f"# epoch_start_s={epoch_start_s}\n")
+        f.write(
+            "timestamp_s,"
+            "accel_x,accel_y,accel_z,"
+            "gyro_x,gyro_y,gyro_z,"
+            "mag_x,mag_y,mag_z\n"
+        )
 
-        end_ms = time.ticks_add(ticks_start_ms,
-                                int(POSITION_SAMPLE_DURATION_S * 1000))
+        # ── Phase 1: IMU / Magnetometer stream (20 s) ─────────────────────────
+        end_ms = time.ticks_add(ticks_start_ms, int(POSITION_SAMPLE_DURATION_S * 1000))
 
         while time.ticks_diff(end_ms, time.ticks_ms()) > 0:
-            # Elapsed time since first sample (seconds, 3 decimal places)
             elapsed_ms = time.ticks_diff(time.ticks_ms(), ticks_start_ms)
             t_s = elapsed_ms / 1000.0
 
-            data = read_positional()
-            ax, ay, az = data["accel"]
-            gx, gy, gz = data["gyro"]
-            mx, my, mz = data["mag"]
+            ax, ay, az, gx, gy, gz, mx, my, mz = read_positional()
 
-            # Write a CSV row compatible with PostProcess.py (9 values)
-            # CSV row format:
-            #   timestamp_s, ax, ay, az, gx, gy, gz, mx, my, mz
             f.write(
                 f"{t_s:.3f},"
                 f"{ax},{ay},{az},"
@@ -158,31 +215,54 @@ def run_full_stream():
                 f"{mx},{my},{mz}\n"
             )
 
-            # Console output
-            accel_str = f"{ax:>5.1f} {ay:>5.1f} {az:>5.1f}"
-            gyro_str  = f"{gx:>5.1f} {gy:>5.1f} {gz:>5.1f}"
-            mag_str   = f"{mx:>5} {my:>5} {mz:>5}"
-            print(f"{t_s:>10.3f} | {accel_str} | {gyro_str} | {mag_str}", end="\r")
+            # Live console output
+            print(
+                f"{t_s:>10.3f} | "
+                f"{ax:>5.1f} {ay:>5.1f} {az:>5.1f} | "
+                f"{gx:>5.1f} {gy:>5.1f} {gz:>5.1f} | "
+                f"{mx:>5} {my:>5} {mz:>5}",
+                end="\r",
+            )
 
-            time.sleep(SAMPLE_INTERVAL_S)
+            time.sleep(IMU_SAMPLE_INTERVAL_S)
 
-    # --- Temperatures ---
+    # ── Phase 2: Temperatures ─────────────────────────────────────────────────
+    print("\nReading temperatures…")
     temps = read_temperatures()
-    print("\nTemps:", temps)
-    with open(CSV_FILENAME, "a") as f:
-        temp_strs = ["" if t is None else str(t) for t in temps]
-        f.write("TEMPS," + ",".join(temp_strs) + "\n")
+    print("Temps (°C):", temps)
 
-    # --- Wind ---
-    wind = read_wind()
-    print("Wind:", wind)
-    with open(CSV_FILENAME, "a") as f:
-        dir_str = "" if wind["avg_direction"] is None else str(wind["avg_direction"])
-        spd_str = "" if wind["avg_speed"]     is None else str(wind["avg_speed"])
-        f.write("WIND," + dir_str + "," + spd_str + "\n")
+    with open(CSV_PATH, "a") as f:
+        f.write("# --- temperatures (°C) ---\n")
+        f.write("# format: TEMPS,t_pin7,t_pin8,t_pin9\n")
+        t_strs = [("" if t is None else f"{t:.4f}") for t in temps]
+        f.write("TEMPS," + ",".join(t_strs) + "\n")
 
-    print("\nLogging complete →", CSV_FILENAME)
+    # ── Phase 3a: Wind direction (10 s AS5600) ───────────────────────────────
+    print(f"Sampling wind direction for {WIND_SAMPLE_DURATION_S:.0f} s (AS5600)…")
+    avg_direction_deg = read_wind_direction()
+    dir_str = f"{avg_direction_deg:.2f}°" if avg_direction_deg is not None else "N/A"
+    print(f"  Avg direction: {dir_str}")
+
+    # ── Phase 3b: Wind speed (10 s hall-effect) ───────────────────────────────
+    print(f"Sampling wind speed for {WIND_SAMPLE_DURATION_S:.0f} s (hall-effect)…")
+    wind = read_wind_speed()
+    print(
+        f"  Total clicks : {wind['total_clicks']}\n"
+        f"  CPS          : {wind['cps']:.4f}\n"
+        f"  Avg period   : "
+        + (f"{wind['avg_period_s']:.6f} s" if wind['avg_period_s'] is not None else "N/A")
+    )
+
+    with open(CSV_PATH, "a") as f:
+        f.write("# --- wind ---\n")
+        f.write("# format: WIND,total_clicks,cps,avg_period_s,avg_direction_deg\n")
+        p_str = ("" if wind["avg_period_s"]  is None else f"{wind['avg_period_s']:.6f}")
+        d_str = ("" if avg_direction_deg     is None else f"{avg_direction_deg:.2f}")
+        f.write(f"WIND,{wind['total_clicks']},{wind['cps']:.4f},{p_str},{d_str}\n")
+
+    print(f"\nLogging complete → {CSV_PATH}")
+    print("Files on SD:", os.listdir("/sd/"))
 
 
-# Launch
+# ── Entry point ───────────────────────────────────────────────────────────────
 run_full_stream()
