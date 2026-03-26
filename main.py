@@ -19,7 +19,7 @@ compass = QMC5883(i2c)
 encoder = AS5600(i2c)
 
 # --- 3. Temperature probe setup (DS18B20) ---
-TEMP_PINS    = [15, 16, 17]
+TEMP_PINS    = [7, 8, 9]
 temp_buses   = [onewire.OneWire(Pin(pin)) for pin in TEMP_PINS]
 temp_sensors = [ds18x20.DS18X20(bus) for bus in temp_buses]
 
