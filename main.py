@@ -148,6 +148,7 @@ def run_full_stream():
             gx, gy, gz = data["gyro"]
             mx, my, mz = data["mag"]
 
+            # Write a CSV row compatible with PostProcess.py (9 values)
             # CSV row format:
             #   timestamp_s, ax, ay, az, gx, gy, gz, mx, my, mz
             f.write(
