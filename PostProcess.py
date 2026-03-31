@@ -507,30 +507,39 @@ def plot_heave_spectrum(freqs: np.ndarray, psd: np.ndarray,
 
 
 def plot_raw(data_dict: dict):
-    """Plot raw accelerometer, gyroscope, and magnetometer traces."""
-    samples    = data_dict.get("samples", [])
+    """Plot raw IMU data, zoomed into the middle 10 seconds."""
+    samples = data_dict.get("samples", [])
     timestamps = data_dict.get("timestamps")
+    fs = data_dict.get("fs", NOMINAL_RATE_HZ)
+    
     if not samples:
         return
-    cols = list(zip(*samples))
-
+    
+    # --- ZOOM LOGIC ---
+    total_samples = len(samples)
+    mid_idx = total_samples // 2
+    window_half = int((10 * fs) / 2)  # 5 seconds each way
+    start, end = max(0, mid_idx - window_half), min(total_samples, mid_idx + window_half)
+    
+    # Slice the data
+    view_samples = samples[start:end]
+    cols = list(zip(*view_samples))
+    
     if timestamps is not None:
-        x      = timestamps - timestamps[0]
-        xlabel = "Time (s)  [from timestamps]"
+        x = timestamps[start:end] - timestamps[0]
+        xlabel = "Time (s) [Relative to Start of Log]"
     else:
-        x      = np.arange(len(samples))
-        xlabel = "Sample Index"
+        x = np.arange(start, end) / fs
+        xlabel = "Time (s) [Estimated]"
 
     fig, axes = plt.subplots(3, 1, figsize=(12, 9), sharex=True)
-    fig.suptitle("Raw IMU Data", fontsize=13)
-    labels = ["X", "Y", "Z"]
-    colors = ["tab:red", "tab:green", "tab:blue"]
-    titles = ["Accelerometer (m/s²)", "Gyroscope (deg/s)", "Magnetometer (raw)"]
-
+    fig.suptitle("Raw IMU Data (Middle 10s Window)", fontsize=13)
+    
+    # ... rest of your plotting loop remains the same ...
+    labels, colors, titles = ["X", "Y", "Z"], ["tab:red", "tab:green", "tab:blue"], ["Accel", "Gyro", "Mag"]
     for row, (title, offset) in enumerate(zip(titles, [0, 3, 6])):
         for j in range(3):
-            axes[row].plot(x, cols[offset + j], label=labels[j],
-                           color=colors[j], alpha=0.8)
+            axes[row].plot(x, cols[offset + j], label=labels[j], color=colors[j], alpha=0.8)
         axes[row].set_title(title)
         axes[row].legend(loc="right")
         axes[row].grid(True, linestyle="--", alpha=0.4)
@@ -538,35 +547,38 @@ def plot_raw(data_dict: dict):
     plt.tight_layout()
 
 
-def plot_attitude(pitch_rad, roll_rad, yaw_ned_rad,
-                  timestamps: np.ndarray = None, dt: float = 1.0 / NOMINAL_RATE_HZ):
-    """Plot fused pitch, roll, and heading over time."""
+def plot_attitude(pitch_rad, roll_rad, yaw_ned_rad, 
+                  timestamps=None, dt=1.0/NOMINAL_RATE_HZ):
+    """Plot fused attitude, zoomed into the middle 10 seconds."""
+    fs = 1.0 / dt
+    total_samples = len(pitch_rad)
+    mid_idx = total_samples // 2
+    window_half = int((10 * fs) / 2)
+    start, end = max(0, mid_idx - window_half), min(total_samples, mid_idx + window_half)
+
+    # Slice data
+    p_view = np.degrees(pitch_rad[start:end])
+    r_view = np.degrees(roll_rad[start:end])
+    y_view = np.degrees(yaw_ned_rad[start:end]) % 360
+    
     if timestamps is not None:
-        t      = timestamps - timestamps[0]
-        xlabel = "Time (s)  [from timestamps]"
+        t = timestamps[start:end] - timestamps[0]
     else:
-        t      = np.arange(len(pitch_rad)) * dt
-        xlabel = f"Time (s)  [nominal {1/dt:.0f} Hz]"
+        t = np.arange(start, end) * dt
 
     fig, axes = plt.subplots(3, 1, figsize=(12, 8), sharex=True)
-    fig.suptitle("Fused Attitude", fontsize=13)
+    fig.suptitle("Fused Attitude (Middle 10s Window)", fontsize=13)
 
-    axes[0].plot(t, np.degrees(pitch_rad),        color="tab:red")
+    axes[0].plot(t, p_view, color="tab:red")
     axes[0].set_title("Pitch (°)")
-    axes[0].axhline(0, color="black", lw=0.6, ls="--")
-    axes[0].grid(True, linestyle="--", alpha=0.4)
-
-    axes[1].plot(t, np.degrees(roll_rad),         color="tab:green")
+    axes[1].plot(t, r_view, color="tab:green")
     axes[1].set_title("Roll (°)")
-    axes[1].axhline(0, color="black", lw=0.6, ls="--")
-    axes[1].grid(True, linestyle="--", alpha=0.4)
-
-    axes[2].plot(t, np.degrees(yaw_ned_rad) % 360, color="tab:blue")
+    axes[2].plot(t, y_view, color="tab:blue")
     axes[2].set_title("True Heading (°)")
-    axes[2].set_ylim(0, 360)
-    axes[2].set_xlabel(xlabel)
-    axes[2].grid(True, linestyle="--", alpha=0.4)
-
+    
+    for ax in axes:
+        ax.grid(True, linestyle="--", alpha=0.4)
+    axes[-1].set_xlabel("Time (s)")
     plt.tight_layout()
 
 

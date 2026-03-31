@@ -9,8 +9,14 @@ from machine import Pin, SoftI2C
 from AS5600 import AS5600
 
 # ── Hardware ───────────────────────────────────────────────────────────────────
-i2c     = SoftI2C(scl=Pin(3), sda=Pin(2), freq=400_000)
+i2c     = SoftI2C(scl=Pin(3), sda=Pin(2), freq=100_000)
 encoder = AS5600(i2c)
+
+status = i2c.readfrom_mem(0x36, 0x0B, 1)[0]
+print(f"STATUS: {status:#010b}")
+# Bit 5 (MH) = magnet too strong
+# Bit 4 (ML) = magnet too weak  
+# Bit 3 (MD) = magnet detected
 
 def read_raw():
     """Returns raw 12-bit angle (0–4095)."""

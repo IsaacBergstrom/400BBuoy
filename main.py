@@ -78,9 +78,10 @@ def _hall_irq(pin):
 hall_pin.irq(trigger=Pin.IRQ_FALLING, handler=_hall_irq)
 
 # ── Runtime config ────────────────────────────────────────────────────────────
-POSITION_SAMPLE_DURATION_S = 20.0   # how long to stream IMU/Mag
-WIND_SAMPLE_DURATION_S      = 10.0  # hall-effect window
+POSITION_SAMPLE_DURATION_S = 120.0   # how long to stream IMU/Mag
+WIND_SAMPLE_DURATION_S      = 30.0  # hall-effect window (direction + speed each)
 IMU_SAMPLE_INTERVAL_S       =  0.1  # 10 Hz
+REST_DURATION_S             = 120.0 # sleep between logging cycles (2 min)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helper functions
@@ -179,7 +180,7 @@ def read_wind_speed(duration_s=WIND_SAMPLE_DURATION_S):
 # Main routine
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_full_stream():
+def run_full_stream(csv_path):
     # ── Console header ────────────────────────────────────────────────────────
     print("\n" + "=" * 115)
     print(f"{'TIME (s)':>10} | {'ACCEL (m/s²)':^20} | {'GYRO (°/s)':^20} | {'MAG (raw)':^20}")
@@ -189,7 +190,7 @@ def run_full_stream():
     epoch_start_s  = time.time()
     ticks_start_ms = time.ticks_ms()
 
-    with open(CSV_PATH, "w") as f:
+    with open(csv_path, "w") as f:
         # ── File header ───────────────────────────────────────────────────────
         f.write(f"# epoch_start_s={epoch_start_s}\n")
         f.write(
@@ -231,7 +232,7 @@ def run_full_stream():
     temps = read_temperatures()
     print("Temps (°C):", temps)
 
-    with open(CSV_PATH, "a") as f:
+    with open(csv_path, "a") as f:
         f.write("# --- temperatures (°C) ---\n")
         f.write("# format: TEMPS,t_pin7,t_pin8,t_pin9\n")
         t_strs = [("" if t is None else f"{t:.4f}") for t in temps]
@@ -253,16 +254,32 @@ def run_full_stream():
         + (f"{wind['avg_period_s']:.6f} s" if wind['avg_period_s'] is not None else "N/A")
     )
 
-    with open(CSV_PATH, "a") as f:
+    with open(csv_path, "a") as f:
         f.write("# --- wind ---\n")
         f.write("# format: WIND,total_clicks,cps,avg_period_s,avg_direction_deg\n")
         p_str = ("" if wind["avg_period_s"]  is None else f"{wind['avg_period_s']:.6f}")
         d_str = ("" if avg_direction_deg     is None else f"{avg_direction_deg:.2f}")
         f.write(f"WIND,{wind['total_clicks']},{wind['cps']:.4f},{p_str},{d_str}\n")
 
-    print(f"\nLogging complete → {CSV_PATH}")
+    print(f"\nLogging complete → {csv_path}")
     print("Files on SD:", os.listdir("/sd/"))
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
-run_full_stream()
+# ── Entry point — continuous logging loop ─────────────────────────────────────
+cycle = 0
+while True:
+    cycle += 1
+    csv_path = get_next_filename()
+    print(f"\n{'='*40}")
+    print(f"  Cycle {cycle}  →  {csv_path}")
+    print(f"{'='*40}")
+
+    try:
+        run_full_stream(csv_path)
+    except Exception as e:
+        # Log the error but keep the loop alive — a single bad cycle
+        # (SD glitch, sensor dropout) shouldn't stop the buoy.
+        print(f"ERROR in cycle {cycle}: {e}")
+
+    print(f"Resting for {REST_DURATION_S:.0f} s before next cycle…")
+    time.sleep(REST_DURATION_S)
