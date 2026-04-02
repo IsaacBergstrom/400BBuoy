@@ -12,42 +12,9 @@ from AS5600 import AS5600
 i2c     = SoftI2C(scl=Pin(3), sda=Pin(2), freq=100_000)
 encoder = AS5600(i2c)
 
-status = i2c.readfrom_mem(0x36, 0x0B, 1)[0]
-print(f"STATUS: {status:#010b}")
-# Bit 5 (MH) = magnet too strong
-# Bit 4 (ML) = magnet too weak  
-# Bit 3 (MD) = magnet detected
 
-def read_raw():
-    """Returns raw 12-bit angle (0–4095)."""
-    try:
-        raw = encoder.RAWANGLE
-        return int(raw) if raw is not None else None
-    except Exception as e:
-        print(f"\nRead error: {e}")
-        return None
+encoder.check_magnet()   # run this first to verify your air gap
 
-def raw_to_deg(raw):
-    return (raw / 4096.0) * 360.0
-
-def compass_point(deg):
-    idx = int((deg + 11.25) / 22.5) % 16
-    pts = ["N","NNE","NE","ENE","E","ESE","SE","SSE",
-           "S","SSW","SW","WSW","W","WNW","NW","NNW"]
-    return pts[idx]
-
-# ── Print header ───────────────────────────────────────────────────────────────
-print("AS5600 live reader — spin the shaft, Ctrl+C to stop\n")
-print(f"{'Raw':>6}  {'Degrees':>9}  {'Point':>5}  {'Bar'}")
-print("-" * 60)
-
-# ── Main loop ──────────────────────────────────────────────────────────────────
 while True:
-    raw = read_raw()
-    if raw is not None:
-        deg = raw_to_deg(raw)
-        pt  = compass_point(deg)
-        bar_len = int(deg / 360.0 * 40)
-        bar = "█" * bar_len + "░" * (40 - bar_len)
-        print(f"{raw:>6}  {deg:>8.2f}°  {pt:>5}  {bar}", end="\r")
-    time.sleep_ms(100)
+    if encoder.magnet_detected:
+        print(encoder.angle_deg)

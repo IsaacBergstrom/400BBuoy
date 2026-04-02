@@ -20,15 +20,15 @@ def run_5s_sample():
     global click_timestamps
     click_timestamps = [] # Reset for new window
     
-    print("Starting 5-second reading...")
+    print("Starting 20-second reading...")
     start_time = time.time()
     
     # Wait for 5 seconds while the Interrupt collects data in the background
-    time.sleep(5)
+    time.sleep(20)
     
     # Calculate Results
     total_clicks = len(click_timestamps)
-    cps = total_clicks / 5.0
+    cps = total_clicks / 20.0
     
     print("-" * 30)
     print("Reading Complete.")

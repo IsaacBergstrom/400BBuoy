@@ -19,6 +19,17 @@ from mpu6500 import MPU6500
 from qmc5883P import QMC5883
 from AS5600 import AS5600
 
+# ── LEDs ──────────────────────────────────────────────────────────────────────
+# GP14 = yellow (sampling active)   GP15 = red (error)
+led_yellow = Pin(14, Pin.OUT)
+led_red    = Pin(15, Pin.OUT)
+led_yellow.off()   # explicit reset — value=0 in constructor is not
+led_red.off()      # guaranteed to fire if pin was already high on restart
+
+def leds_off():
+    led_yellow.off()
+    led_red.off()
+
 # ── 1. SD Card (SPI 1) ────────────────────────────────────────────────────────
 spi = machine.SPI(
     1,
@@ -35,7 +46,8 @@ try:
     print("SD card mounted.")
 except Exception as e:
     print("SD mount failed:", e)
-    raise   # Nothing can be saved without the SD card — stop here.
+    led_red.on()     # red on — fatal error before loop even starts
+    raise
 
 
 def get_next_filename(base="accel", ext=".csv"):
@@ -56,15 +68,27 @@ CSV_PATH = get_next_filename()
 print(f"Logging to: {CSV_PATH}")
 
 # ── 2. I2C Sensors ────────────────────────────────────────────────────────────
-i2c     = SoftI2C(scl=Pin(3), sda=Pin(2), freq=400_000)
-imu     = MPU6500(i2c, 0x69)
-compass = QMC5883(i2c)
-encoder = AS5600(i2c)
+try:
+    i2c     = SoftI2C(scl=Pin(3), sda=Pin(2), freq=400_000)
+    imu     = MPU6500(i2c, 0x69)
+    compass = QMC5883(i2c)
+    encoder = AS5600(i2c)
+    print("I2C sensors initialised.")
+except Exception as e:
+    print("I2C init failed:", e)
+    led_red.on()
+    raise
 
 # ── 3. Temperature Probes (DS18B20) ───────────────────────────────────────────
-TEMP_PINS    = [7, 8, 9]          # 2 of 3 physically connected — safe to scan all
-temp_buses   = [onewire.OneWire(Pin(p)) for p in TEMP_PINS]
-temp_sensors = [ds18x20.DS18X20(bus) for bus in temp_buses]
+try:
+    TEMP_PINS    = [7, 8, 9]
+    temp_buses   = [onewire.OneWire(Pin(p)) for p in TEMP_PINS]
+    temp_sensors = [ds18x20.DS18X20(bus) for bus in temp_buses]
+    print("Temperature buses initialised.")
+except Exception as e:
+    print("Temperature init failed:", e)
+    led_red.on()
+    raise
 
 TEMP_CONVERSION_WAIT_MS = 750
 
@@ -77,10 +101,15 @@ def _hall_irq(pin):
 
 hall_pin.irq(trigger=Pin.IRQ_FALLING, handler=_hall_irq)
 
+# ── Sensor calibration offsets ───────────────────────────────────────────────
+ACCEL_OFFSETS = (-0.61479, -0.08098,  0.17939)
+GYRO_OFFSETS  = (-0.18238, -0.04456,  0.01112)
+MAG_OFFSETS   = ( 0.0,     -0.5,    124.5    )
+
 # ── Runtime config ────────────────────────────────────────────────────────────
-POSITION_SAMPLE_DURATION_S = 120.0   # how long to stream IMU/Mag
-WIND_SAMPLE_DURATION_S      = 30.0  # hall-effect window (direction + speed each)
-IMU_SAMPLE_INTERVAL_S       =  0.1  # 10 Hz
+POSITION_SAMPLE_DURATION_S = 300.0  # how long to stream IMU/Mag (5 min)
+WIND_SAMPLE_DURATION_S      =  30.0 # hall-effect window (direction + speed each)
+IMU_SAMPLE_INTERVAL_S       =   0.1 # 10 Hz
 REST_DURATION_S             = 120.0 # sleep between logging cycles (2 min)
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -88,13 +117,25 @@ REST_DURATION_S             = 120.0 # sleep between logging cycles (2 min)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def read_positional():
-    """Return one IMU + magnetometer sample."""
-    ax, ay, az = imu.acceleration
-    gx, gy, gz = imu.gyro
+    """Return one calibrated IMU + magnetometer sample."""
+    ax_raw, ay_raw, az_raw = imu.acceleration
+    gx_raw, gy_raw, gz_raw = imu.gyro
 
     compass.measure()
     raw_mag = compass.i2c_readregs(0x00, 6)
-    mx, my, mz = ustruct.unpack('<hhh', raw_mag)
+    mx_raw, my_raw, mz_raw = ustruct.unpack('<hhh', raw_mag)
+
+    ax = ax_raw - ACCEL_OFFSETS[0]
+    ay = ay_raw - ACCEL_OFFSETS[1]
+    az = az_raw - ACCEL_OFFSETS[2]
+
+    gx = gx_raw - GYRO_OFFSETS[0]
+    gy = gy_raw - GYRO_OFFSETS[1]
+    gz = gz_raw - GYRO_OFFSETS[2]
+
+    mx = mx_raw - MAG_OFFSETS[0]
+    my = my_raw - MAG_OFFSETS[1]
+    mz = mz_raw - MAG_OFFSETS[2]
 
     return (ax, ay, az, gx, gy, gz, mx, my, mz)
 
@@ -135,9 +176,8 @@ def read_wind_direction(duration_s=WIND_SAMPLE_DURATION_S, interval_s=0.1):
     end_ms = time.ticks_add(time.ticks_ms(), int(duration_s * 1000))
     while time.ticks_diff(end_ms, time.ticks_ms()) > 0:
         try:
-            raw = encoder.RAWANGLE
-            if raw is not None:
-                angle_deg  = (int(raw) / 4096.0) * 360.0
+            if encoder.magnet_detected:
+                angle_deg  = encoder.angle_deg
                 theta      = angle_deg * (math.pi / 180.0)
                 sum_sin   += math.sin(theta)
                 sum_cos   += math.cos(theta)
@@ -187,6 +227,8 @@ def run_full_stream(csv_path):
     print(f"{'':>10} | {'X      Y      Z':^20} | {'X      Y      Z':^20} | {'X      Y      Z':^20}")
     print("=" * 115)
 
+    led_yellow.on()   # sampling active
+
     epoch_start_s  = time.time()
     ticks_start_ms = time.ticks_ms()
 
@@ -197,11 +239,19 @@ def run_full_stream(csv_path):
             "timestamp_s,"
             "accel_x,accel_y,accel_z,"
             "gyro_x,gyro_y,gyro_z,"
-            "mag_x,mag_y,mag_z\n"
+            "mag_x,mag_y,mag_z,"
+            "wind_vane_deg\n"
+            "# wind_vane_deg is blank for the first "
+            f"{POSITION_SAMPLE_DURATION_S - WIND_SAMPLE_DURATION_S:.0f} s, "
+            f"populated for the final {WIND_SAMPLE_DURATION_S:.0f} s\n"
         )
 
-        # ── Phase 1: IMU / Magnetometer stream (20 s) ─────────────────────────
-        end_ms = time.ticks_add(ticks_start_ms, int(POSITION_SAMPLE_DURATION_S * 1000))
+        # ── Phase 1: IMU / Magnetometer stream ───────────────────────────────
+        # During the final WIND_SAMPLE_DURATION_S seconds, also read the AS5600
+        # wind vane so wind direction is time-aligned with IMU data for post-
+        # processing into a true heading. Earlier rows get an empty wind column.
+        end_ms       = time.ticks_add(ticks_start_ms, int(POSITION_SAMPLE_DURATION_S * 1000))
+        wind_start_s = POSITION_SAMPLE_DURATION_S - WIND_SAMPLE_DURATION_S
 
         while time.ticks_diff(end_ms, time.ticks_ms()) > 0:
             elapsed_ms = time.ticks_diff(time.ticks_ms(), ticks_start_ms)
@@ -209,11 +259,21 @@ def run_full_stream(csv_path):
 
             ax, ay, az, gx, gy, gz, mx, my, mz = read_positional()
 
+            # Read wind vane only during the final wind-sampling window
+            wind_deg_str = ""
+            if t_s >= wind_start_s:
+                try:
+                    if encoder.magnet_detected:
+                        wind_deg_str = f"{encoder.angle_deg:.2f}"
+                except Exception:
+                    pass
+
             f.write(
                 f"{t_s:.3f},"
                 f"{ax},{ay},{az},"
                 f"{gx},{gy},{gz},"
-                f"{mx},{my},{mz}\n"
+                f"{mx},{my},{mz},"
+                f"{wind_deg_str}\n"
             )
 
             # Live console output
@@ -221,7 +281,8 @@ def run_full_stream(csv_path):
                 f"{t_s:>10.3f} | "
                 f"{ax:>5.1f} {ay:>5.1f} {az:>5.1f} | "
                 f"{gx:>5.1f} {gy:>5.1f} {gz:>5.1f} | "
-                f"{mx:>5} {my:>5} {mz:>5}",
+                f"{mx:>5} {my:>5} {mz:>5}"
+                + (f" | wind {wind_deg_str}°" if wind_deg_str else ""),
                 end="\r",
             )
 
@@ -263,6 +324,7 @@ def run_full_stream(csv_path):
 
     print(f"\nLogging complete → {csv_path}")
     print("Files on SD:", os.listdir("/sd/"))
+    led_yellow.off()  # sampling done
 
 
 # ── Entry point — continuous logging loop ─────────────────────────────────────
@@ -270,6 +332,7 @@ cycle = 0
 while True:
     cycle += 1
     csv_path = get_next_filename()
+    leds_off()   # both off at the start of every cycle
     print(f"\n{'='*40}")
     print(f"  Cycle {cycle}  →  {csv_path}")
     print(f"{'='*40}")
@@ -277,9 +340,10 @@ while True:
     try:
         run_full_stream(csv_path)
     except Exception as e:
-        # Log the error but keep the loop alive — a single bad cycle
-        # (SD glitch, sensor dropout) shouldn't stop the buoy.
+        # Log the error, light red, keep the loop alive
         print(f"ERROR in cycle {cycle}: {e}")
+        led_yellow.off()
+        led_red.on()
 
     print(f"Resting for {REST_DURATION_S:.0f} s before next cycle…")
     time.sleep(REST_DURATION_S)
